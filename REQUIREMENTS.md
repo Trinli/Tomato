@@ -1,0 +1,96 @@
+# Tomato watering system — requirements
+
+## Hardware / pins
+
+```
+GP17: Pump 1
+GP20: Pump 2
+GP19: Sensor 1, sense (1k)
+GP18: Sensor 1, charge (1M)
+GP22: Sensor 2, sense (1k)
+GP21: Sensor 2, charge (1M)
+GP10 & GP9: Button 1
+GP8: Green led 1
+GP6: Yellow led 1
+GP5 & GP3: Button 2
+GP2: Green led 2
+GP1: Yellow led 2
+GP0: Red led
+```
+
+Each button shorts one GPIO straight to GND when pressed (read with an internal pull-up): GP10 for button 1, GP5 for button 2. Button 1 and 2 originally each had a second, redundant leg (GP9, GP3) shorted to GND at the same time; firmware no longer reads them. Not a voltage-drop concern — a pulled-up input only draws tens of µA when shorted to GND, negligible next to the pump-motor current that the mutual-exclusion requirement below actually guards against. The motivation is wiring reliability: fewer physical connections means fewer places for a loose/flaky contact to cause a spurious trigger, which is directly relevant to the known issue below.
+
+**Hardware TODO (not yet done):** physically disconnect GP9 and GP3 — firmware has stopped reading them, but the wires are still there until removed.
+
+## Current requirements
+
+### Sensor logging
+- Updated 2026-07-08: the median of each 20-reading batch is now computed **on-device**, not downstream — the 20 raw readings themselves are no longer written to flash at all. This was a flash-wear/capacity fix: at the old rate (raw readings written every 5 minutes) a month of unattended logging would grow to roughly 1.8MB across both sensors, likely exceeding the Pico's filesystem budget for a system meant to run a month straight unattended.
+- Each sensor still takes 20 back-to-back capacitive charge-time readings per timestamp (the median of the 20 is still the robust "true" reading — outliers in individual readings are common and must not skew the signal), but only that median is kept, in RAM, per 5-minute batch (`INTERVAL_SECONDS`).
+- Every 12th batch (one hour's worth, `SAMPLES_PER_HOUR`), the hour's 12 medians are reduced to `mean_us`/`min_us`/`max_us` and written as a single row. Sensor 1 logs to `cap_log.csv`, sensor 2 to `cap_log_2.csv`, schema: `seconds_since_start,mean_us,min_us,max_us`. This is a breaking schema change from the old per-5-min `seconds_since_start` + `reading_1_us..reading_20_us` format — `ensure_log_header` only writes a header when a file doesn't already exist, so the old raw-format `cap_log.csv`/`cap_log_2.csv` must be archived or deleted before flashing this firmware, the same way past logs have already been archived (e.g. `cap_log_2026.07.04.csv`), or old and new rows will end up mixed in one file.
+- "Hourly" here is sample-count-based (12 completed 5-minute cycles), not wall-clock: an hour containing pump activity takes slightly longer than 3600s of real time to fill, since sensor reading pauses while a pump runs (see "Single-tasking" below). Each row still carries the true `seconds_since_start`, so only the cadence between rows stretches, not correctness.
+- The board's uptime clock resets to 0 on every reboot; there's no persisted real-world clock, so analysis treats each reboot as a new "session" with its own elapsed-time axis rather than assuming a continuous timeline across a reboot. The in-RAM hourly buffer is lost on an unexpected reboot mid-hour, same as any other RAM-only state (see "Automatic watering" below).
+
+### Manual watering
+- Updated 2026-07-07: watering is now a **long-press start/stop toggle**, not a press-counted pulse.
+  - A button must be held down continuously for at least `LONG_PRESS_MS` (1 second) and then released to register at all; a short tap does nothing. This also acts as a natural debounce — ordinary mechanical contact bounce (milliseconds) can never accumulate to a full second, so no separate debounce constant is needed.
+  - A qualifying long-press on an idle system starts that pump. A qualifying long-press on the *same* button while its pump is already running stops it early.
+  - Every pump run is hard-capped at `MAX_PUMP_RUN_MS` (3 minutes) regardless of button activity, enforced by the same one-shot hardware timer used to start the run (cancelled early via `Timer.deinit()` if the button stops it first, to prevent a stale timer from firing later and clobbering a *different*, subsequently-started run of that pump).
+- **The two pumps must never run simultaneously** (hard requirement — motivated by the voltage-drop/reset risk noted from the start). Enforced by a single software `active_pump` lock plus the button-deafening below (no queueing of any kind: a long-press on the other button while a pump runs is simply not receivable).
+
+### Automatic (threshold-based) watering
+- New, 2026-07-08, and **always on** — runs continuously whether or not anyone is around, with no separate build/flag (see "Vacation mode" below for why the earlier opt-in-flag plan was dropped). Buttons remain fully live throughout, including while an automatic pulse is running — same rules as manual watering apply unchanged (the running pump's own button can still long-press-stop it early; the idle pump's button stays deafened while any pump runs, auto- or button-triggered).
+- Each pot's own sensor drives its own pump (sensor 1 → pump 1, sensor 2 → pump 2). Right after each hourly aggregate is computed (see "Sensor logging" above), that pot's hourly mean is checked against its threshold: pump 1 / sensor 1 = 200µs, pump 2 / sensor 2 = 250µs. Both are provisional and may need tuning as more field data comes in (250µs was already flagged from a 2026-07-08 field observation on pump 2).
+- If the hourly mean is below the pot's threshold, that pot gets exactly one pulse: a normal pump run reusing the existing `start_pump`/`MAX_PUMP_RUN_MS` mechanism (3 minutes, ≈3dl per the "1 min ≈ 1dl" rule of thumb) — no new stop mechanism was needed since the existing hardware timer already auto-stops it.
+- **Cooldown:** after a pulse, that pot isn't re-evaluated for at least 1 hour (`COOLDOWN_SECONDS`, derived from `SAMPLES_PER_HOUR × INTERVAL_SECONDS` so it stays correct if either constant changes).
+- **Daily safety cap:** at most 8 pulses per pot per rolling 24 hours (`DAILY_CAP`, tracked independently per pot — so up to 16 total across both pots/day). Implemented as a rolling window of pulse timestamps (entries older than 24h are pruned before checking the cap), not a fixed calendar-day counter, so it can't be bypassed by two bursts straddling a day boundary.
+- **Interaction with mutual exclusion:** auto-triggering goes through the same `start_pump` atomic gatekeeper as manual watering (see below) — if a pump is already running (button- or auto-triggered) when an hourly evaluation fires, the trigger is simply skipped for that hour and the pot is re-evaluated at its next hourly flush. No queueing, consistent with the existing "no queueing of any kind" rule.
+- **Race-condition fix required for this feature:** previously `start_pump` was only ever called from a button IRQ handler, which made an unguarded `active_pump is None` check-then-set safe by accident (IRQ handlers can't preempt each other). Automatic watering calls `start_pump` from the main loop instead, which is ordinary preemptible code — a button IRQ could fire between the check and the set and start a second pump. Fixed by making `start_pump` itself the atomic gatekeeper via `machine.disable_irq()`/`enable_irq()` around just the check-and-set; it now returns `True`/`False` (started or not) instead of assuming success.
+- All new state (the hourly sample buffer, each pot's last-pulse time, each pot's rolling 24h pulse-timestamp list) lives only in RAM and resets on reboot, consistent with the existing session model (no persisted real-world clock). This means a burst of reboots within 24h could in theory let a pot receive more than 8 real-world pulses across boots even though each individual boot session respects the cap — the 1-hour cooldown still bounds the worst case to at most 1 pulse/hour regardless, so this is an accepted, understood trade-off rather than an unbounded risk.
+
+### The idle pump's button is fully deaf while the other pump is running
+- Voltage sag from a running pump can spuriously read as a button press (see Known issues), so the button for the pump that is *not* running has its IRQ fully detached (`pin.irq(handler=None)`) for as long as the other pump is active, and reattached the moment it stops. This is a stronger guarantee than ignoring reads in software — the interrupt genuinely cannot fire.
+- The *running* pump's own button stays live throughout its run, specifically so a genuine long-press can still stop it early — this is intentional and different from the idle button's blackout.
+- Supersedes the previous (2026-07-06) design of deafening *both* buttons for the whole run: that only made sense when there was no way to stop a run early anyway. It in turn had replaced an even earlier design (stacking/queueing button presses) after a field incident where a pump ran twice as long as intended and the *other* pump later auto-started with no corresponding button press at all — which pointed at spurious voltage-drop-induced GPIO reads occurring throughout a pump's run, not just at switch-on.
+- Residual risk: a spurious trigger arriving in the brief window between a genuine press and the IRQ actually being detached is still possible in principle, though the code path is short. Switch-off transients (back-EMF) are also still uncovered — see Known issues.
+
+### Single-tasking: watering and sensor reading never overlap
+- The Pico does one thing at a time: `sample_sensor_median` checks `active_pump` before every one of its 20 reads and aborts (discarding the partial batch, no hourly sample recorded) the moment a pump activates.
+- If a watering activation is in progress, the main loop postpones the next sensor-reading batch until watering finishes (polling every `IDLE_POLL_MS` while `active_pump` is set).
+- A button press still starts the pump immediately via hardware IRQ regardless of what the main loop is doing (unchanged) — what's new is that an in-progress sensor batch now yields to it instead of running to completion.
+- Button activation itself remains interrupt-driven (not polled), so pump response time to a press is unaffected by this change.
+
+### Pump event logging
+- Updated 2026-07-07: every start and every stop of a pump (whether the stop was a long-press or the `MAX_PUMP_RUN_MS` cap firing) is logged to `pump_log.csv` as `seconds_since_start,pump,pulse_count` — the third column is now `1` for a start and `0` for a stop. The CSV header text wasn't changed (still says `pulse_count`), but rows logged before 2026-07-07 used that column for a cumulative stack/queue pulse count instead (values could be >1) — anything reading historical `pump_log.csv` data should treat pre-2026-07-07 values differently from the `0`/`1` used afterward.
+
+### Vacation mode ("semesterversion") — retired, 2026-07-08
+- Originally proposed 2026-07-06: since button presses could spuriously trigger a pump (see Known issues) and the electronics weren't going to be reworked further at the time, the plan was a firmware-level mitigation — an opt-in build/flag that fully ignored button presses while away/unsupervised, relying only on sensor logging (no automatic watering existed yet to fall back on).
+- Retired now that the underlying wiring short has been root-caused and fixed (frayed strands trimmed 2026-07-06; a separate stripped-wire contact fault found and relocated 2026-07-08 — see Known issues) and automatic threshold-based watering exists as a real fallback for unattended periods (see "Automatic (threshold-based) watering" above). Blocking all buttons is no longer necessary: automatic watering just runs continuously regardless of whether anyone's around, and buttons stay live at all times rather than needing a separate build/flag to disable them.
+
+### Startup behavior
+- All LEDs flash once at boot as a visual "firmware started" signal.
+- Button interrupts are armed only *after* log-file setup and the LED flash have completed (plus a short settle delay), so that boot-time power transients from that setup can't be misread as a button press.
+
+### Known issues / open safety concerns (still open)
+
+- **Root cause confirmed, 2026-07-05: stray wire strands causing an intermittent short.** Field-tested 2026-07-05: pump activity was observed while the circuit was just being handled/moved around (not intentionally pressing a button), and both pumps appeared to run at the same time when only one button had been pressed. Initially suspected as one wire peeled further than necessary and touching a MOSFET gate — a hardware short, not a firmware/interlock bug. This is consistent with the software `active_pump` lock never actually failing (it can't prevent a MOSFET being driven externally, outside the GPIO it's supposed to control).
+- **Recurrence, 2026-07-06:** user touched/prodded a sensor and believes they may have accidentally shorted it. Both pumps then ran 30 seconds each, one after the other (not simultaneously) — sequencing matched the intentional queueing design exactly, but the triggering itself confirmed the underlying wiring problem was still present.
+- **Fix applied, 2026-07-06:** root cause refined. It was frayed strands ("fransar") from a wire whose end hadn't been fully passed through the circuit board — loose strands that could touch neighboring contacts whenever the wire was moved or handled. Fixed by trimming the frayed strands and properly seating the wire through the board.
+- **Still recurring, 2026-07-06:** at least one pump has apparently still triggered sporadically even after that fix. The user does not want to rework the electronics again right now, so the agreed mitigations going forward are software-level ones — see "Vacation mode" and "The idle pump's button is fully deaf while the other pump is running" above — rather than further immediate hardware changes.
+- **Second recurrence, field-tested 2026-07-06:** user pressed button 1 (pump 1 ran its intended pulse and stopped completely), then pressed button 2 a couple of times (pump 2 stacked to a full minute under the old design) — and *without any further button 1 press*, pump 1 then ran again for another minute. Since the old queueing logic requires an actual press on the idle pump's button to arm it, pump 1 restarting with zero button-1 presses is only explainable by a spurious GPIO read during pump 2's run — confirming the voltage-drop issue isn't confined to the switch-on transient. This first motivated fully detaching both button IRQs for the whole duration any pump runs, and was later refined (2026-07-07, see above) into the long-press start/stop toggle plus per-button deafening.
+- **Third recurrence, overnight, 2026-07-07:** a pump triggered again running the version of the firmware with both buttons fully deafened for the whole duration of any pump run (the design in place before the 2026-07-07 long-press rework above). All electronics were sitting in a closed box and nobody was around to handle or move anything, which rules out the frayed-wire/physical-disturbance explanation for this instance specifically. Triggering reason unknown — this is the first recurrence that can't be attributed to handling, so a cause other than a movement-induced short (e.g. spontaneous EMI/noise, a marginal contact that closes on its own without being touched, or something else entirely) should now be considered alongside the wiring theory.
+- The software mitigations added 2026-07-05 (one GPIO per button, single-tasking between sensor reading and watering — both under Current requirements above) remain in place as good practice, though they weren't what fixed the confirmed root cause, which was a physical short rather than a spurious GPIO reading.
+- **New root cause found, 2026-07-08: pump wire contact fault, different from the frayed-strand issue.** One of the pump cables had a fault again, but this time it wasn't loose/frayed strands — the whole cable's stripped/exposed section was touching another conductor. Fixed by relocating that wire to a different spot on the circuit board with less risk of this kind of contact. Given the 2026-07-07 overnight recurrence happened with no handling at all, this relocated wire is a plausible (if unconfirmed) culprit for that instance too, alongside the EMI/marginal-contact theories raised there.
+- Status: unresolved, though two distinct root causes have now been found and fixed (2026-07-06 frayed strands, 2026-07-08 stripped-wire relocation) and no further recurrence has been reported since. Automatic watering (above) no longer depends on blocking buttons as a mitigation, so the physical wiring issue can be revisited independently, at whatever pace is convenient, without blocking use of the system unattended.
+
+## Planned for later (not yet implemented)
+
+- **Adjust trigger levels** (pump 1 / sensor 1 = 200µs, pump 2 / sensor 2 = 250µs, see "Automatic (threshold-based) watering" above) once more field data is available — both are still provisional starting points, not tuned values.
+- **Possible hardware-level interlock** as a backstop for pump mutual-exclusion, if the software-only lock turns out to be insufficient once the known issue above is understood.
+
+## Notes on the sensing approach
+
+- Pots have copper tape on opposing sides creating a capacitor. Capacitance changes when soil is wet, since the permittivity of water is much higher than that of soil.
+- Capacitance also decreases when temperature increases (permittivity of warm water is lower than cold water), and evaporative cooling further complicates measuring an absolute degree of "wetness."
+- We can nonetheless clearly distinguish "recently watered" from "dry" — the goal is relative/trend detection, not an absolute moisture reading.
+- Rule of thumb: one minute of pumping is approximately 1 dl of water.
