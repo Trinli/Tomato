@@ -7,6 +7,11 @@ BLUE = "#2a78d6"
 AQUA = "#1baf7a"
 PUMP_COLORS = {1: "#d6822a", 2: "#af1b6e"}
 
+# A session shorter than this (e.g. a reboot moments ago) doesn't have enough
+# data to be worth showing on its own in a "recent" view; fall back to the
+# previous session instead.
+MIN_SESSION_HOURS = 1
+
 
 def add_session_columns(df):
     df["session_id"] = (df["seconds_since_start"].diff() < 0).cumsum()
@@ -15,6 +20,18 @@ def add_session_columns(df):
     )
     df["days_since_start"] = df["seconds_in_session"] / 86400
     return df
+
+
+def select_recent_session_id(df, min_hours=MIN_SESSION_HOURS):
+    """Most recent session_id with at least min_hours of data, plus how many
+    sessions back from the true latest one that is (0 if the latest qualifies)."""
+    span_by_session = df.groupby("session_id")["seconds_in_session"].max()
+    max_id = span_by_session.index.max()
+    for session_id in sorted(span_by_session.index, reverse=True):
+        if span_by_session[session_id] >= min_hours * 3600:
+            return session_id, max_id - session_id
+    min_id = span_by_session.index.min()
+    return min_id, max_id - min_id
 
 
 def styled_figure(title):
@@ -52,7 +69,7 @@ def add_pump_traces(fig, pump_df):
         )
 
 
-def build_charts(log_file, sensor_label, plot_html, hourly_html, pump_df):
+def build_charts(log_file, sensor_label, plot_html, hourly_html, pump_df, last_hours=None):
     df = pd.read_csv(log_file)
     reading_cols = [c for c in df.columns if c.startswith("reading_")]
     is_raw_format = len(reading_cols) > 0
@@ -62,19 +79,34 @@ def build_charts(log_file, sensor_label, plot_html, hourly_html, pump_df):
     df = add_session_columns(df)
     n_sessions = df["session_id"].nunique()
 
-    # Only the current run matters day to day, so drop everything before the
-    # most recent restart.
-    last_session = df["session_id"].max()
-    df = df[df["session_id"] == last_session].reset_index(drop=True)
-    pump_df = pump_df[pump_df["session_id"] == pump_df["session_id"].max()]
+    if last_hours is not None:
+        # A "recent" view falls back to the previous session if the latest one
+        # just started (e.g. a reboot moments ago) and doesn't have enough data
+        # on its own yet.
+        session_id, steps_back = select_recent_session_id(df)
+        df = df[df["session_id"] == session_id].reset_index(drop=True)
+        pump_session_id = pump_df["session_id"].max() - steps_back
+        pump_df = pump_df[pump_df["session_id"] == pump_session_id]
+        if steps_back:
+            print(f"{log_file}: latest session too short for a {last_hours}h view, using the previous session instead")
+        cutoff = df["seconds_in_session"].max() - last_hours * 3600
+        df = df[df["seconds_in_session"] >= cutoff].reset_index(drop=True)
+        pump_df = pump_df[pump_df["seconds_in_session"] >= cutoff]
+    else:
+        # Only the current run matters day to day, so drop everything before
+        # the most recent restart.
+        last_session = df["session_id"].max()
+        df = df[df["session_id"] == last_session].reset_index(drop=True)
+        pump_df = pump_df[pump_df["session_id"] == pump_df["session_id"].max()]
 
     print(f"{log_file}: {n_sessions} session(s) (device restart(s)) total; showing only the latest")
+    title_suffix = f" — last {last_hours}h" if last_hours is not None else ""
 
     if not is_raw_format:
         # Firmware since 2026-07-08 logs one already-aggregated row per hour
         # (seconds_since_start,mean_us,min_us,max_us) instead of 20 raw
         # readings per 5-min sample, so no client-side resampling is needed.
-        fig = styled_figure(f"{sensor_label} charge time — hourly mean and range (aggregated on-device)")
+        fig = styled_figure(f"{sensor_label} charge time — hourly mean and range (aggregated on-device){title_suffix}")
         fig.add_trace(go.Scatter(
             x=df["days_since_start"], y=df["max_us"],
             name="Max", mode="lines", line=dict(color=MUTED_GRAY, width=1, dash="dot"),
@@ -100,7 +132,7 @@ def build_charts(log_file, sensor_label, plot_html, hourly_html, pump_df):
 
     # --- Per-sample chart: median/mean/min/max across the 20 readings at each timestamp ---
     fig = styled_figure(
-        f"{sensor_label} charge time — median (robust), mean, and range across 20 readings per sample"
+        f"{sensor_label} charge time — median (robust), mean, and range across 20 readings per sample{title_suffix}"
     )
     fig.add_trace(go.Scatter(
         x=df["days_since_start"], y=df["max_us"],
@@ -128,7 +160,7 @@ def build_charts(log_file, sensor_label, plot_html, hourly_html, pump_df):
     hourly_df["days_since_start"] = hourly_df.index.total_seconds() / 86400
     hourly_df = hourly_df.reset_index(drop=True)
 
-    fig2 = styled_figure(f"Hourly aggregation of {sensor_label.lower()} median charge time — smoothing sample-to-sample noise")
+    fig2 = styled_figure(f"Hourly aggregation of {sensor_label.lower()} median charge time — smoothing sample-to-sample noise{title_suffix}")
     fig2.add_trace(go.Scatter(
         x=hourly_df["days_since_start"], y=hourly_df["max"],
         name="Hourly max", mode="lines", line=dict(color=MUTED_GRAY, width=1, dash="dot"),
@@ -151,3 +183,13 @@ pump_df = add_session_columns(pump_df)
 
 build_charts("cap_log.csv", "Sensor 1", "cap_log_plot.html", "cap_log_hourly.html", pump_df)
 build_charts("cap_log_2.csv", "Sensor 2", "cap_log_2_plot.html", "cap_log_2_hourly.html", pump_df)
+
+LAST_DAY_HOURS = 24
+build_charts(
+    "cap_log.csv", "Sensor 1", "cap_log_plot_last_day.html", "cap_log_hourly_last_day.html",
+    pump_df, last_hours=LAST_DAY_HOURS,
+)
+build_charts(
+    "cap_log_2.csv", "Sensor 2", "cap_log_2_plot_last_day.html", "cap_log_2_hourly_last_day.html",
+    pump_df, last_hours=LAST_DAY_HOURS,
+)
