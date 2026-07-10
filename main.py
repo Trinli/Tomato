@@ -73,8 +73,9 @@ pulse_history = {1: [], 2: []}  # rolling 24h list of this pot's auto-pulse time
 # Both pots' hourly buffers always fill in lockstep (see the main loop), so
 # when both need water in the same hour, pot 1 is evaluated first and holds
 # the mutual-exclusion lock for its whole run. pending_watering lets pot 2's
-# blocked trigger fire the moment pot 1's pump stops, instead of waiting a
-# full extra hour for its own next evaluation - see stop_pump.
+# blocked trigger fire as soon as pot 1's pump stops, instead of waiting a
+# full extra hour for its own next evaluation - the main loop services it,
+# not stop_pump itself (see the main loop for why).
 pending_watering = {1: None, 2: None}  # None, or the hourly mean_us that was blocked
 
 
@@ -255,13 +256,17 @@ def stop_pump(pump_id):
     enable_button(other)
 
     # If the other pot's auto-trigger was blocked by this run holding the
-    # lock, retry it now instead of making it wait for its own next hourly
-    # evaluation - re-runs the full threshold/cooldown/cap check with a
-    # current timestamp, using the hourly mean from when it was queued.
-    if pending_watering[other] is not None:
-        mean_us = pending_watering[other]
-        pending_watering[other] = None
-        evaluate_watering(other, mean_us, time.time() - start_time)
+    # lock, it's left queued in pending_watering for the main loop to pick
+    # up on its next idle iteration (see the main loop) - not retried here.
+    # This stop_pump call is itself commonly running inside this pump's own
+    # MAX_PUMP_RUN_MS Timer callback; retrying synchronously from here would
+    # arm the retried pump's Timer (and log its start/eventually its stop)
+    # from *inside* that callback - a Timer callback nested inside another
+    # Timer callback. A 2026-07-10 field incident traced a 5+ hour total
+    # lockup to exactly this: the nested pump's own stop, one level deeper
+    # still, physically turned its pump off on schedule but then hung the
+    # whole interpreter before its flash log write completed - see Known
+    # issues in REQUIREMENTS.md.
 
 
 def handle_long_press(pump_id):
@@ -317,6 +322,20 @@ while True:
         # postpone sensor reading until the pump is done.
         time.sleep_ms(IDLE_POLL_MS)
         continue
+
+    # Service any auto-trigger that stop_pump left queued because the other
+    # pot's pump was running at the time (see pending_watering, stop_pump).
+    # Doing the retry here - ordinary main-loop code - rather than inside
+    # stop_pump itself means start_pump's Timer.init() and flash write for
+    # the retried pump never run nested inside another timer/IRQ callback.
+    retried = False
+    for pump_id in (1, 2):
+        if pending_watering[pump_id] is not None:
+            mean_us = pending_watering[pump_id]
+            evaluate_watering(pump_id, mean_us, time.time() - start_time)
+            retried = True
+    if retried:
+        continue  # re-check active_pump before falling through to sensors
 
     seconds_since_start = time.time() - start_time
 
