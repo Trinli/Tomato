@@ -2,7 +2,7 @@
 Code for tomato watering system.
 
 Pots have copper tape on opposing sides creating a capacitor. Capacitance
-changes when the soil is wet, since the permittivity of water is much
+changes when the soil is wet since the permittivity of water is much
 higher than that of soil. Capacitance also decreases when temperature
 increases (permittivity of warm water is lower than cold water), and
 evaporative cooling further complicates measuring an absolute degree of
@@ -29,7 +29,7 @@ IDLE_POLL_MS = 100  # how often the main loop checks whether watering has finish
 # Automatic threshold-based watering: each pot gets one MAX_PUMP_RUN_MS pulse
 # whenever its hourly mean charge time drops below its threshold, subject to
 # a cooldown and a daily cap. See REQUIREMENTS.md "Automatic watering".
-THRESHOLDS_US = {1: 200, 2: 250}
+THRESHOLDS_US = {1: 225, 2: 255}
 SAMPLES_PER_HOUR = 3600 // INTERVAL_SECONDS  # 12
 COOLDOWN_SECONDS = SAMPLES_PER_HOUR * INTERVAL_SECONDS  # 3600s
 DAILY_CAP = 8
@@ -69,6 +69,13 @@ SENSOR_LOG_FILES = {1: LOG_FILE_1, 2: LOG_FILE_2}
 hourly_buffers = {1: [], 2: []}
 last_pulse_time = {1: None, 2: None}  # None = not pulsed yet this boot
 pulse_history = {1: [], 2: []}  # rolling 24h list of this pot's auto-pulse timestamps
+
+# Both pots' hourly buffers always fill in lockstep (see the main loop), so
+# when both need water in the same hour, pot 1 is evaluated first and holds
+# the mutual-exclusion lock for its whole run. pending_watering lets pot 2's
+# blocked trigger fire the moment pot 1's pump stops, instead of waiting a
+# full extra hour for its own next evaluation - see stop_pump.
+pending_watering = {1: None, 2: None}  # None, or the hourly mean_us that was blocked
 
 
 def ensure_log_header(log_file, header):
@@ -159,6 +166,11 @@ def record_hourly_sample(pump_id, sample_median_us, seconds_since_start):
 
 
 def evaluate_watering(pump_id, mean_us, seconds_since_start):
+    # This evaluation supersedes any earlier queued retry for this pot -
+    # either it resolves to a fresh pump start (or a fresh queued retry)
+    # below, or an early return here means the pot no longer needs one.
+    pending_watering[pump_id] = None
+
     if mean_us >= THRESHOLDS_US[pump_id]:
         return  # soil wet enough
 
@@ -173,10 +185,13 @@ def evaluate_watering(pump_id, mean_us, seconds_since_start):
 
     # start_pump() is the atomic mutual-exclusion gatekeeper - if a
     # button-triggered or the other pot's auto-triggered run is already
-    # active, this is a no-op; the next hourly flush re-evaluates fresh.
+    # active, queue this pot to retry the instant that run's stop_pump
+    # fires, rather than waiting a full extra hour for its own next flush.
     if start_pump(pump_id):
         last_pulse_time[pump_id] = seconds_since_start
         pulse_history[pump_id].append(seconds_since_start)
+    else:
+        pending_watering[pump_id] = mean_us
 
 
 def log_pump_event(pump_id, started):
@@ -236,7 +251,17 @@ def stop_pump(pump_id):
     pumps[pump_id].value(0)
     active_pump = None
     log_pump_event(pump_id, started=False)
-    enable_button(2 if pump_id == 1 else 1)
+    other = 2 if pump_id == 1 else 1
+    enable_button(other)
+
+    # If the other pot's auto-trigger was blocked by this run holding the
+    # lock, retry it now instead of making it wait for its own next hourly
+    # evaluation - re-runs the full threshold/cooldown/cap check with a
+    # current timestamp, using the hourly mean from when it was queued.
+    if pending_watering[other] is not None:
+        mean_us = pending_watering[other]
+        pending_watering[other] = None
+        evaluate_watering(other, mean_us, time.time() - start_time)
 
 
 def handle_long_press(pump_id):
